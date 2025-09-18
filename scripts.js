@@ -77,7 +77,7 @@ document.addEventListener('DOMContentLoaded', () => {
             const orderData = await response.json();
 
             paymentInfoDiv.innerHTML = `
-                <h3>¡Gracias por tu apoyo!</h3>
+                <h3>¡Gracias por tu apoyo!</h3> 
                 <p>Para completar la donación, envía el monto a la siguiente dirección:</p>
                 <p><strong>Payment Pointer:</strong> ${orderData.paymentPointer}</p>
                 <p><strong>Monto:</strong> ${orderData.amount} ${orderData.currency}</p>
