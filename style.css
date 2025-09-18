@@ -1,207 +1,304 @@
-/* --- Reseteo y configuración base --- */
-* {
-    margin: 0;
-    padding: 0;
-    box-sizing: border-box;
+// --- DEPENDENCIAS ---
+require("dotenv").config();
+const express = require('express');
+const cors = require('cors');
+const { createAuthenticatedClient, isPendingGrant } = require("@interledger/open-payments");
+
+// --- CONFIGURACIÓN ---
+const app = express();
+const port = process.env.PORT || 3001;
+
+app.use(cors());
+app.use(express.json());
+
+// --- LÓGICA DE OPEN PAYMENTS ---
+let openPaymentsClient;
+
+async function getOpenPaymentsClient() {
+    if (openPaymentsClient) {
+        return openPaymentsClient;
+    }
+
+    try {
+        if (!process.env.WALLET_ADDRESS_URL) {
+            throw new Error("WALLET_ADDRESS_URL no está definido");
+        }
+        if (!process.env.PRIVATE_KEY_BASE64) {
+            throw new Error("PRIVATE_KEY_BASE64 no está definido");
+        }
+        if (!process.env.KEY_ID) {
+            throw new Error("KEY_ID no está definido");
+        }
+
+        const privateKey = Buffer.from(process.env.PRIVATE_KEY_BASE64, "base64").toString("utf-8");
+
+        const client = await createAuthenticatedClient({
+            walletAddressUrl: process.env.WALLET_ADDRESS_URL,
+            privateKey: privateKey,
+            keyId: process.env.KEY_ID,
+        });
+        
+        openPaymentsClient = client;
+        console.log("✨ Cliente de Open Payments conectado y autenticado.");
+        return client;
+    } catch (error) {
+        console.error("🔴 Error creando el cliente:", error.message);
+        throw error;
+    }
 }
 
-body {
-    font-family: 'Montserrat', sans-serif;
-    color: #e0f2e9;
-background: linear-gradient(90deg, #f5841b, #fcf125);
-    background-size: 400% 400%;
-    animation: gradientBG 20s ease infinite;
-    min-height: 100vh;
-    overflow-x: hidden;
-    padding: 40px 20px;
-}
+// --- ENDPOINT PARA CREAR SOLICITUD DE PAGO ---
+app.post("/api/create-payment-request", async (req, res) => {
+    const { amount, currency, description } = req.body;
 
-@keyframes gradientBG {
-    0% { background-position: 0% 50%; }
-    50% { background-position: 100% 50%; }
-    100% { background-position: 0% 50%; }
-}
+    if (!amount || !currency || !description) {
+        return res.status(400).json({ error: "Faltan datos: amount, currency, description" });
+    }
 
-.scanlines {
-    position: fixed;
-    top: 0;
-    left: 0;
-    width: 100%;
-    height: 100%;
-    background: repeating-linear-gradient(0deg, rgba(0, 0, 0, 0.3), rgba(0, 0, 0, 0.3) 1px, transparent 1px, transparent 3px);
-    pointer-events: none;
-    z-index: 10;
-}
+    try {
+        const client = await getOpenPaymentsClient();
+        const WALLET_ADDRESS = process.env.WALLET_ADDRESS_URL;
 
-.main-header {
-    text-align: center;
-    margin-bottom: 60px;
-    opacity: 0;
-    transform: translateY(20px);
-    animation: fadeIn-up 0.8s ease forwards;
-}
+        // 1. Obtener información de la wallet address del destinatario
+        console.log("🔍 Obteniendo información de wallet address...");
+        const walletAddress = await client.walletAddress.get({
+            url: WALLET_ADDRESS,
+        });
 
-.main-header h1 {
-    font-family: 'Orbitron', sans-serif;
-    font-size: 4rem;
-    color: #ffffff;
-    text-shadow: 0 0 10px #00f6ff, 0 0 20px #00f6ff, 0 0 40px #00f6ff;
-    margin-bottom: 10px;
-}
+        // 2. Solicitar grant de autorización para incoming payment
+        console.log("🔍 Solicitando grant de autorización...");
+        const grant = await client.grant.request(
+            {
+                url: walletAddress.authServer,
+            },
+            {
+                access_token: {
+                    access: [
+                        {
+                            type: "incoming-payment",
+                            actions: ["list", "read", "read-all", "complete", "create"],
+                        },
+                    ],
+                },
+            }
+        );
 
-.main-header p {
-    font-size: 1.2rem;
-    max-width: 600px;
-    margin: 0 auto;
-    line-height: 1.6;
-}
+        if (!grant.access_token || !grant.access_token.value) {
+            throw new Error("No se recibió token de acceso en el grant");
+        }
 
-.causes-container {
-    display: grid;
-    grid-template-columns: repeat(auto-fit, minmax(320px, 1fr));
-    gap: 30px;
-    max-width: 1200px;
-    margin: 0 auto;
-}
+        const INCOMING_PAYMENT_ACCESS_TOKEN = grant.access_token.value;
 
-.cause-card {
-    background-color: rgba(10, 25, 40, 0.7);
-    backdrop-filter: blur(10px);
-    border: 2px solid #00f6ff;
-    border-radius: 15px;
-    overflow: hidden;
-    box-shadow: 0 0 15px rgba(0, 246, 255, 0.3);
-    transition: all 0.3s ease;
-    opacity: 0;
-    transform: translateY(20px);
-    animation: fadeIn-up 0.8s ease forwards;
-}
+        // 3. Crear incoming payment
+        console.log("🔍 Creando incoming payment...");
+        const incomingPayment = await client.incomingPayment.create(
+            {
+                url: new URL(WALLET_ADDRESS).origin,
+                accessToken: INCOMING_PAYMENT_ACCESS_TOKEN,
+            },
+            {
+                walletAddress: WALLET_ADDRESS,
+                incomingAmount: {
+                    value: amount.toString(),
+                    assetCode: currency,
+                    assetScale: 2,
+                },
+                expiresAt: new Date(Date.now() + 5 * 60 * 1000).toISOString(),
+                metadata: {
+                    description: description
+                }
+            }
+        );
 
-.cause-card:nth-child(1) { animation-delay: 0.2s; }
-.cause-card:nth-child(2) { animation-delay: 0.4s; }
-.cause-card:nth-child(3) { animation-delay: 0.6s; }
+        console.log(`✅ Incoming payment creado: ${incomingPayment.id}`);
 
-.cause-card:hover {
-    transform: translateY(-10px);
-    box-shadow: 0 0 25px rgba(0, 246, 255, 0.7);
-}
+        // Devolver información al frontend
+        res.json({
+            paymentId: incomingPayment.id,
+            paymentPointer: WALLET_ADDRESS,
+            amount: amount,
+            currency: currency,
+            incomingPaymentUrl: incomingPayment.id, // URL completa del incoming payment
+            description: description
+        });
 
-.cause-card img {
-    width: 100%;
-    height: 200px;
-    object-fit: cover;
-    display: block;
-}
+    } catch (error) {
+        console.error("🔴 Error en /api/create-payment-request:");
+        console.error("Mensaje:", error.message);
+        console.error("Stack:", error.stack);
+        
+        if (error.response?.data) {
+            console.error("Datos de respuesta:", error.response.data);
+        }
+        
+        res.status(500).json({ 
+            error: "Error interno del servidor",
+            details: error.message
+        });
+    }
+});
 
-.card-content { padding: 25px; }
-.card-content h2 { font-family: 'Orbitron', sans-serif; font-size: 1.8rem; color: #ffffff; margin-bottom: 15px; }
-.card-content p { font-size: 1rem; line-height: 1.5; margin-bottom: 20px; }
+// --- ENDPOINT PARA CREAR COTIZACIÓN ---
+app.post("/api/create-quote", async (req, res) => {
+    const { incomingPaymentUrl, senderWalletAddress } = req.body;
 
-.support-button {
-    font-family: 'Orbitron', sans-serif;
-    background-color: transparent;
-    color: #ff00e1;
-    border: 2px solid #ff00e1;
-    padding: 12px 25px;
-    font-size: 1rem;
-    font-weight: bold;
-    border-radius: 5px;
-    cursor: pointer;
-    transition: all 0.3s ease;
-    text-transform: uppercase;
-}
+    if (!incomingPaymentUrl || !senderWalletAddress) {
+        return res.status(400).json({ error: "Faltan datos: incomingPaymentUrl, senderWalletAddress" });
+    }
 
-.support-button:hover {
-    background-color: #ff00e1;
-    color: #0d2f3f;
-    box-shadow: 0 0 10px #ff00e1, 0 0 20px #ff00e1;
-}
+    try {
+        const client = await getOpenPaymentsClient();
 
-@keyframes fadeIn-up {
-    from { opacity: 0; transform: translateY(20px); }
-    to { opacity: 1; transform: translateY(0); }
-}
+        // 1. Obtener información de la wallet address del remitente
+        const walletAddress = await client.walletAddress.get({
+            url: senderWalletAddress,
+        });
 
-.modal-overlay {
-    position: fixed;
-    top: 0;
-    left: 0;
-    width: 100%;
-    height: 100%;
-    background-color: rgba(0, 0, 0, 0.7);
-    backdrop-filter: blur(5px);
-    display: flex;
-    justify-content: center;
-    align-items: center;
-    z-index: 100;
-}
+        // 2. Solicitar grant de autorización para quote
+        const grant = await client.grant.request(
+            {
+                url: walletAddress.authServer,
+            },
+            {
+                access_token: {
+                    access: [
+                        {
+                            type: "quote",
+                            actions: ["create", "read", "read-all"],
+                        },
+                    ],
+                },
+            }
+        );
 
-.modal-content {
-    position: relative;
-    background-color: rgba(10, 25, 40, 0.85);
-    backdrop-filter: blur(15px);
-    border: 2px solid #00f6ff;
-    border-radius: 15px;
-    padding: 40px;
-    width: 90%;
-    max-width: 500px;
-    box-shadow: 0 0 25px rgba(0, 246, 255, 0.7);
-    text-align: center;
-}
+        if (!grant.access_token || !grant.access_token.value) {
+            throw new Error("No se recibió token de acceso para quote");
+        }
 
-.modal-content h2 { font-family: 'Orbitron', sans-serif; margin-bottom: 20px; }
+        const QUOTE_ACCESS_TOKEN = grant.access_token.value;
 
-.close-button {
-    position: absolute;
-    top: 15px;
-    right: 20px;
-    background: none;
-    border: none;
-    color: #e0f2e9;
-    font-size: 2rem;
-    cursor: pointer;
-    line-height: 1;
-}
+        // 3. Crear quote
+        const quote = await client.quote.create(
+            {
+                url: new URL(senderWalletAddress).origin,
+                accessToken: QUOTE_ACCESS_TOKEN,
+            },
+            {
+                method: "ilp",
+                walletAddress: senderWalletAddress,
+                receiver: incomingPaymentUrl,
+            }
+        );
 
-#modal-form input, #modal-form select {
-    width: 100%;
-    padding: 12px;
-    font-size: 1rem;
-    margin-bottom: 15px;
-    background-color: rgba(0, 0, 0, 0.3);
-    border: 1px solid #00f6ff;
-    color: #e0f2e9;
-    border-radius: 5px;
-}
+        console.log(`✅ Quote creada: ${quote.id}`);
 
-#modal-form select {
-    appearance: none;
-    background-image: url("data:image/svg+xml;charset=UTF-8,%3csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%2300f6ff' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3e%3cpolyline points='6 9 12 15 18 9'%3e%3c/polyline%3e%3c/svg%3e");
-    background-repeat: no-repeat;
-    background-position: right 1rem center;
-    background-size: 1em;
-}
+        res.json({
+            quoteId: quote.id,
+            quoteUrl: quote.id,
+            debitAmount: quote.debitAmount,
+            receiveAmount: quote.receiveAmount,
+            expiresAt: quote.expiresAt
+        });
 
-#confirm-support-button {
-    width: 100%;
-    font-family: 'Orbitron', sans-serif;
-    background-color: #ff00e1;
-    color: #0d2f3f;
-    border: 2px solid #ff00e1;
-    padding: 12px 25px;
-    font-size: 1rem;
-    font-weight: bold;
-    border-radius: 5px;
-    cursor: pointer;
-    transition: all 0.3s ease;
-    text-transform: uppercase;
-}
+    } catch (error) {
+        console.error("🔴 Error en /api/create-quote:", error.message);
+        res.status(500).json({ error: "Error creando cotización", details: error.message });
+    }
+});
 
-#confirm-support-button:hover { box-shadow: 0 0 10px #ff00e1, 0 0 20px #ff00e1; }
-#payment-info { margin-top: 20px; text-align: left; word-break: break-all; }
-#payment-info strong { color: #00f6ff; }
+// --- ENDPOINT PARA INICIAR PAGO SALIENTE ---
+app.post("/api/initiate-outgoing-payment", async (req, res) => {
+    const { quoteUrl, senderWalletAddress, finishUri, nonce } = req.body;
 
-@media (max-width: 768px) {
-    .main-header h1 { font-size: 3rem; }
-    .main-header p { font-size: 1rem; }
-}
+    if (!quoteUrl || !senderWalletAddress || !finishUri || !nonce) {
+        return res.status(400).json({ error: "Faltan datos requeridos" });
+    }
+
+    try {
+        const client = await getOpenPaymentsClient();
+
+        // 1. Obtener información de la wallet address del remitente
+        const walletAddress = await client.walletAddress.get({
+            url: senderWalletAddress,
+        });
+
+        // 2. Obtener información de la quote
+        const quote = await client.quote.get({ url: quoteUrl });
+
+        // 3. Solicitar grant interactivo para outgoing payment
+        const grant = await client.grant.request(
+            {
+                url: walletAddress.authServer,
+            },
+            {
+                access_token: {
+                    access: [
+                        {
+                            identifier: walletAddress.id,
+                            type: "outgoing-payment",
+                            actions: ["list", "list-all", "read", "read-all", "create"],
+                            limits: {
+                                debitAmount: {
+                                    assetCode: quote.debitAmount.assetCode,
+                                    assetScale: quote.debitAmount.assetScale,
+                                    value: quote.debitAmount.value,
+                                },
+                            },
+                        },
+                    ],
+                },
+                interact: {
+                    start: ["redirect"],
+                    finish: {
+                        method: "redirect",
+                        uri: finishUri,
+                        nonce: nonce,
+                    },
+                },
+            }
+        );
+
+        if (!isPendingGrant(grant)) {
+            throw new Error("Se esperaba un grant interactivo");
+        }
+
+        // Devolver información para redirección
+        res.json({
+            redirectUrl: grant.interact.redirect,
+            continueAccessToken: grant.continue.access_token.value,
+            continueUri: grant.continue.uri,
+            interactRef: grant.interact.finish
+        });
+
+    } catch (error) {
+        console.error("🔴 Error en /api/initiate-outgoing-payment:", error.message);
+        res.status(500).json({ error: "Error iniciando pago", details: error.message });
+    }
+});
+
+// --- HEALTH CHECK ---
+app.get("/api/health", async (req, res) => {
+    try {
+        await getOpenPaymentsClient();
+        res.json({ 
+            status: "healthy",
+            walletAddress: process.env.WALLET_ADDRESS_URL
+        });
+    } catch (error) {
+        res.status(500).json({ 
+            status: "unhealthy",
+            error: error.message 
+        });
+    }
+});
+
+// --- INICIAR SERVIDOR ---
+app.listen(port, () => {
+    console.log(`🚀 Servidor escuchando en http://localhost:${port}`);
+    console.log(`🔍 Wallet Address: ${process.env.WALLET_ADDRESS_URL}`);
+    
+    // Conectar con Open Payments al iniciar
+    getOpenPaymentsClient().catch(error => {
+        console.error("⚠️  Error conectando con Open Payments:", error.message);
+    });
+});
